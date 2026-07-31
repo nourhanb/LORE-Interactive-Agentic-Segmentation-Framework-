@@ -1,4 +1,4 @@
-# LORE — Learning to Reason Over Physician Corrections
+# LORE: Learning to Reason Over Physician Corrections
 
 **Accepted at MICCAI 2026 Workshop: [CLiMeM](https://climem.github.io/CLiMeM/index.html) — Continual Learning in Medical Multimodal-Vision**
 
