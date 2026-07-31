@@ -22,7 +22,6 @@ from models.policy import (
     EditConditionedTypePolicy,
     ACTION_POINT, ACTION_BOX, ACTION_SCRIBBLE, ACTION_STOP,
 )
-from models.cpc_uga import PriorityUncertaintyPolicy, mask_uncertainty
 from processor.trainer_basic import _subject_from_dict, _tio_volume_4d, _pad_subject_for_grid
 from processor.trainer import _ensure_5d
 from utils.clinical_priority import priority_mask_from_errors
@@ -67,23 +66,8 @@ class Tester(object):
 
         # Load agent components if enabled
         self.use_medsa = getattr(args, 'use_medsa', False)
-        self.use_cpc_uga = getattr(args, 'use_cpc_uga', False)
-        if self.use_cpc_uga and self.use_medsa:
-            raise ValueError('--use_cpc_uga and --use_medsa are mutually exclusive')
 
-        if self.use_cpc_uga:
-            self.type_policy = PriorityUncertaintyPolicy(
-                state_dim=PriorityUncertaintyPolicy.STATE_DIM,
-            ).to(args.device)
-            ckpt_data = torch.load(ckpt, map_location=args.device, weights_only=False)
-            if 'cpc_uga_state' in ckpt_data:
-                self.type_policy.load_state_dict(ckpt_data['cpc_uga_state']['type_policy'])
-                logger.info("Loaded CPC–UGA policy weights from checkpoint.")
-            else:
-                logger.warning("CPC–UGA enabled but checkpoint has no cpc_uga_state — random policy!")
-            self.type_policy.eval()
-
-        elif self.use_medsa:
+        if self.use_medsa:
             self.edit_encoder = EditDeltaEncoder(in_channels=4).to(args.device)
             self.memory       = CorrectionPatternMemory(max_iters=args.iter_nums + 2).to(args.device)
             self.type_policy  = EditConditionedTypePolicy(
@@ -585,8 +569,7 @@ class Tester(object):
         self.logger.info(
             "- n_cases={} | agent={} | refine_test={} | max_iters={}".format(
                 len(dice_summary),
-                'cpc_uga' if getattr(self.args, 'use_cpc_uga', False)
-                else ('medsa' if getattr(self.args, 'use_medsa', False) else 'none'),
+                'medsa' if getattr(self.args, 'use_medsa', False) else 'none',
                 bool(getattr(self.args, 'refine_test', False) or getattr(self.args, 'refine', False)),
                 self.args.iter_nums,
             ))
@@ -665,8 +648,7 @@ class Tester(object):
             'dataset': getattr(self.args, 'data', ''),
             'save_name': tag,
             'agent': (
-                'cpc_uga' if getattr(self.args, 'use_cpc_uga', False)
-                else ('medsa' if getattr(self.args, 'use_medsa', False) else 'none')
+                'medsa' if getattr(self.args, 'use_medsa', False) else 'none'
             ),
             'n_cases': len(dice_summary),
             'max_iters': int(self.args.iter_nums),
@@ -831,10 +813,7 @@ class Tester(object):
         fp_masks   = (~true_masks & pred_masks)
 
         use_prio = (
-            (
-                getattr(self.args, 'use_clinical_priority', False)
-                or getattr(self.args, 'use_cpc_uga', False)
-            )
+            getattr(self.args, 'use_clinical_priority', False)
             and priority_mask is not None
             and priority_mask.sum() > 0
         )
@@ -903,7 +882,7 @@ class Tester(object):
         self.click_labels.append(points_la)
 
         # Bounding box: only for BOX action (or always-on when agent disabled)
-        agent_on = self.use_medsa or self.use_cpc_uga
+        agent_on = self.use_medsa
         if action == ACTION_BOX or not agent_on:
             bbox_coords = _bbox_mask(label[:, 0, :]).to(dev) if self.args.use_box else None
         elif action != ACTION_SCRIBBLE and self.args.use_box:
@@ -943,164 +922,11 @@ class Tester(object):
         """Match training validation: refine whenever --refine is set (or legacy --refine_test)."""
         return bool(getattr(self.args, 'refine', False) or getattr(self.args, 'refine_test', False))
 
-    def _interaction_cpc_uga(self, sam_model, image, label):
-        """CPC–UGA / dual-uncertainty test loop (no CoCC). Returns rich per-case trace."""
-        max_iters = self.args.iter_nums
-        _fk = getattr(self.args, 'fixed_k', -1)
-        if getattr(self.args, 'force_action', None) and _fk and _fk > 0:
-            max_iters = min(max_iters, _fk)
-
-        image_embedding, feature_list = sam_model.image_encoder(image)
-        self.click_points = []
-        self.click_labels = []
-        prev_masks = torch.zeros_like(label).to(label.device)
-        collected = []
-        iters_used = 0
-        action_counts = {
-            ACTION_POINT: 0, ACTION_BOX: 0, ACTION_SCRIBBLE: 0, ACTION_STOP: 0,
-        }
-        total_effort = 0.0
-        prev_dice = 0.0
-        prev_uncert = 1.0
-
-        dice_curve, uncert_curve, prio_vol_curve, action_seq = [], [], [], []
-        stopped_early = False
-        accept_uncert = float('nan')
-        last_prio_vol = float('nan')
-
-        _force = getattr(self.args, 'force_action', None)
-        _force_map = {'point': ACTION_POINT, 'box': ACTION_BOX, 'scribble': ACTION_SCRIBBLE}
-        forced_action = _force_map.get(_force) if _force else None
-
-        for iter_num in range(max_iters):
-            prev_masks_sigmoid = torch.sigmoid(prev_masks) if iter_num > 0 else prev_masks
-            action = ACTION_POINT
-            priority_mask = None
-
-            label_5d = _ensure_5d(label)
-            pred_5d = _ensure_5d(prev_masks_sigmoid)
-            image_5d = _ensure_5d(image)
-            pred_bin = (pred_5d > 0.5)
-            true_bin = (label_5d > 0)
-            fn_mask = (true_bin & ~pred_bin).float()
-            fp_mask = (~true_bin & pred_bin).float()
-
-            with torch.no_grad():
-                geo = compute_geometric_descriptors(fn_mask, fp_mask, pred_5d)
-                priority_mask, _, _ = priority_mask_from_errors(
-                    fn_mask[0], fp_mask[0], pred_5d[0], image=image_5d[0],
-                    lam_iso=getattr(self.args, 'prio_lam_iso', 1.0),
-                    lam_int=getattr(self.args, 'prio_lam_int', 0.5),
-                    lam_bnd=getattr(self.args, 'prio_lam_bnd', 0.5),
-                )
-                prio_vol = float(priority_mask.sum().item()) / (float(fn_mask[0].numel()) + 1e-8)
-                last_prio_vol = prio_vol
-                bnd = float(geo[0, 3].item())
-
-                if forced_action is not None:
-                    action = forced_action
-                elif iter_num > 0:
-                    curr_dice = self.get_dice_score(prev_masks_sigmoid, label)
-                    state = PriorityUncertaintyPolicy.build_state(
-                        dice_current=float(curr_dice),
-                        delta_dice=float(curr_dice) - prev_dice,
-                        iter_progress=iter_num / max(max_iters, 1),
-                        priority_volume=prio_vol,
-                        uncertainty=prev_uncert,
-                        device=self.args.device,
-                    )
-                    action = self.type_policy.select_action(
-                        state, epsilon=0.0,
-                        priority_volume=prio_vol,
-                        boundary_overlap=bnd,
-                        iter_idx=iter_num,
-                        max_iters=max_iters,
-                        dice_current=float(curr_dice),
-                        uncertainty=prev_uncert,
-                        uncert_low=getattr(self.args, 'uncert_low', 0.35),
-                        uncert_high=getattr(self.args, 'uncert_high', 0.65),
-                    )
-                    prev_dice = float(curr_dice)
-                    if action == ACTION_STOP:
-                        action_counts[ACTION_STOP] += 1
-                        action_seq.append('stop')
-                        stopped_early = True
-                        accept_uncert = float(prev_uncert)
-                        break
-
-            iters_used += 1
-            action_counts[action] = action_counts.get(action, 0) + 1
-            total_effort += self._EFFORT.get(action, 0.1)
-            action_seq.append(_ACT_NAME.get(action, '?'))
-            prio_vol_curve.append(prio_vol)
-
-            points_input, labels_input, bbox_input = self.get_points(
-                prev_masks_sigmoid, label, action=action, priority_mask=priority_mask,
-            )
-            mask, pred_dice_score, _ = self.batch_forward(
-                sam_model, feature_list, image_embedding, image, prev_masks,
-                points=[points_input, labels_input], boxes=bbox_input,
-                medsa_context=None,
-            )
-            prev_uncert = mask_uncertainty(mask, pred_dice_score)
-            uncert_curve.append(float(prev_uncert))
-
-            B = mask.size(0)
-            if self.args.multiple_outputs:
-                _, max_idx = torch.max(pred_dice_score, dim=1)
-                b_idx = torch.arange(B, device=mask.device)
-                mask_best = mask[b_idx, max_idx].unsqueeze(1)
-            else:
-                mask_best = mask
-
-            if self._use_refine():
-                mask_refine, _ = self.sam.mask_decoder.refine(
-                    image, mask_best, [self.click_points, self.click_labels], mask_best.detach())
-                mask_best = mask_refine
-
-            prev_masks = mask_best
-            collected.append(prev_masks.detach().cpu())
-            dice = self.get_dice_score(torch.sigmoid(prev_masks).cpu().numpy(), label.cpu().numpy())
-            dice_curve.append(float(dice))
-            act_name = _ACT_NAME.get(action, '?')
-            print(
-                f'iter: {iters_used} | action: {act_name} | u={prev_uncert:.2f} '
-                f'| prio_vol={prio_vol:.4g} | Dice: {dice:.4f}'
-            )
-
-        all_masks = torch.cat(collected, dim=0) if collected else torch.zeros(
-            [1, 1, image.size(2), image.size(3), image.size(4)])
-        counts = {
-            'point': action_counts.get(ACTION_POINT, 0),
-            'box': action_counts.get(ACTION_BOX, 0),
-            'scribble': action_counts.get(ACTION_SCRIBBLE, 0),
-            'stop': action_counts.get(ACTION_STOP, 0),
-        }
-        if not stopped_early and iters_used >= max_iters:
-            accept_uncert = float(prev_uncert)
-        mean_u = float(np.mean(uncert_curve)) if uncert_curve else float('nan')
-        trace = {
-            'dice_curve': dice_curve,
-            'uncert_curve': uncert_curve,
-            'prio_vol_curve': prio_vol_curve,
-            'action_seq': action_seq,
-            'stopped_early': stopped_early,
-            'hit_max_iters': (not stopped_early) and iters_used >= max_iters,
-            'accept_uncert': accept_uncert,
-            'mean_uncert': mean_u,
-            'final_prio_vol': last_prio_vol,
-            'n_stop': counts['stop'],
-        }
-        return prev_masks, all_masks, iters_used, counts, total_effort, trace
-
     def interaction(self, sam_model, image, label):
         """
-        Run the interaction loop with optional MedSA / CPC–UGA policy-driven stopping.
+        Run the interaction loop with optional MedSA policy-driven stopping.
         Returns: (final_mask, all_masks, iters_used, action_counts, total_effort, trace)
         """
-        if self.use_cpc_uga:
-            return self._interaction_cpc_uga(sam_model, image, label)
-
         max_iters = self.args.iter_nums
         # When running a forced-action ablation, cap to --fixed_k if specified
         _fk = getattr(self.args, 'fixed_k', -1)

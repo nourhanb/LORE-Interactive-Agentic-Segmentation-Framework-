@@ -135,11 +135,7 @@ class Trainer_basic(object):
             # ── DQN update (outside amp.autocast to preserve grad_fn) ────
             # forward() populates the replay buffer and stores _last_lam_rl;
             # we run the actual Q-network backward here, in full fp32.
-            use_agent = (
-                getattr(self.args, 'use_medsa', False)
-                or getattr(self.args, 'use_cpc_uga', False)
-            )
-            if use_agent and hasattr(self, 'type_policy'):
+            if getattr(self.args, 'use_medsa', False) and hasattr(self, 'type_policy'):
                 lam_rl = getattr(self, '_last_lam_rl', 0.)
                 if lam_rl > 0:
                     dqn_loss_val = self.type_policy.update(
@@ -163,29 +159,9 @@ class Trainer_basic(object):
                     f" dice_reg={self._fmt(lc.get('dice_reg', 0))}"
                     + (f" refine={self._fmt(lc.get('refine', 0))}" if lc.get('refine', 0) > 0 else ""))
 
-            # ── Agent diagnostics (MedSA / CPC–UGA) ───────────────────────
+            # ── Agent diagnostics (MedSA) ─────────────────────────────────
             agent_log = ""
-            if getattr(self.args, 'use_cpc_uga', False):
-                lam_rl  = lc.get('_lam_rl', 0.)
-                eps     = lc.get('_epsilon', 0.)
-                dqn_l   = lc.get('dqn',      0.)
-                reward  = lc.get('reward',    0.)
-                u_mean  = lc.get('_uncert',  0.)
-                act_str = (f"pt={lc.get('_act_pt',0)}"
-                           f" bx={lc.get('_act_bx',0)}"
-                           f" sc={lc.get('_act_sc',0)}"
-                           f" st={lc.get('_act_st',0)}")
-                if lam_rl > 0:
-                    rl_str = (f" dqn_loss={self._fmt(dqn_l)}"
-                              f" r/ep={reward:+.3f}"
-                              f" ε={eps:.2f}"
-                              f" u={u_mean:.2f}"
-                              f" [{act_str}]")
-                else:
-                    rl_str = (f" rl=off(ep>{getattr(self.args,'cpc_rl_start_epoch',30)})"
-                              f" u={u_mean:.2f}")
-                agent_log = f" | CPC-UGA:{rl_str}"
-            elif getattr(self.args, 'use_medsa', False):
+            if getattr(self.args, 'use_medsa', False):
                 lam_s   = lc.get('_lam_s',  0.)
                 lam_rl  = lc.get('_lam_rl', 0.)
                 eps     = lc.get('_epsilon', 0.)
@@ -425,11 +401,6 @@ class Trainer_basic(object):
                     'type_policy':      self.type_policy.state_dict(),
                     'policy_optimizer': self.policy_optimizer.state_dict(),
                 }
-            if getattr(self.args, 'use_cpc_uga', False) and hasattr(self, 'type_policy'):
-                ckpt_dict['cpc_uga_state'] = {
-                    'type_policy':      self.type_policy.state_dict(),
-                    'policy_optimizer': self.policy_optimizer.state_dict(),
-                }
             save_checkpoint(ckpt_dict, is_best=is_best, checkpoint=self.args.save_dir)
         self.logger.info("- Val metrics best mean dice: {} at epoch {} " .format(self.best_dice, self.best_epoch))
 
@@ -482,19 +453,6 @@ class Trainer_basic(object):
                 self.logger.info("Resumed MedSA component weights from checkpoint.")
             elif getattr(self.args, 'use_medsa', False):
                 self.logger.warning("MedSA enabled but no medsa_state in checkpoint — using random init.")
-
-            if getattr(self.args, 'use_cpc_uga', False) and 'cpc_uga_state' in ckpt:
-                cs = ckpt['cpc_uga_state']
-                if hasattr(self, 'type_policy'):
-                    self.type_policy.load_state_dict(cs['type_policy'])
-                try:
-                    if hasattr(self, 'policy_optimizer'):
-                        self.policy_optimizer.load_state_dict(cs['policy_optimizer'])
-                except Exception:
-                    self.logger.warning("CPC–UGA policy optimizer incompatible — resetting.")
-                self.logger.info("Resumed CPC–UGA policy weights from checkpoint.")
-            elif getattr(self.args, 'use_cpc_uga', False):
-                self.logger.warning("CPC–UGA enabled but no cpc_uga_state in checkpoint — random init.")
 
             self.logger.info(f"Resume training from epoch {self.start_epoch}!")
             del ckpt

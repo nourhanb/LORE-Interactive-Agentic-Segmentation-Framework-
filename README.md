@@ -17,7 +17,7 @@ src-agentic/
   train.py / test.py          # entry points
   config/                     # argparse + model/dataloader setup
   dataset/                    # TorchIO / MONAI loaders
-  models/                     # SAM-3D, MedSA (LORE), policy, CPC–UGA
+  models/                     # SAM-3D, MedSA (LORE), policy
   processor/                  # training loop
   utils/                      # scribbles, clinical priority, logging
   voxynth/                    # scribble deformation helpers
@@ -71,10 +71,7 @@ sbatch train_code_agentic.sh hecktor
 sbatch train_code_agentic.sh colon
 ```
 
-| Dataset | Default agent |
-|---------|----------------|
-| `hecktor`, `autopet`, `brats` | LORE / MedSA (`--use_medsa`) |
-| `colon`, `pancreas`, `lits`, `kits` | CPC–UGA (`--use_cpc_uga`) |
+All datasets use LORE / MedSA (`--use_medsa`).
 
 Checkpoints and logs are written to:
 

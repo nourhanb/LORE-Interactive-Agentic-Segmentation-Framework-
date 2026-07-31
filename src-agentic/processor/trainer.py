@@ -19,11 +19,6 @@ from models.policy import (
     compute_dqn_reward,
     ACTION_POINT, ACTION_BOX, ACTION_SCRIBBLE, ACTION_STOP,
 )
-from models.cpc_uga import (
-    PriorityUncertaintyPolicy,
-    mask_uncertainty,
-    compute_cpc_reward,
-)
 from utils.clinical_priority import priority_mask_from_errors, priority_hit_score
 from .trainer_basic import Trainer_basic
 
@@ -177,25 +172,7 @@ class Trainer(Trainer_basic):
     def __init__(self, args, logger):
         super().__init__(args, logger)
 
-        if getattr(args, 'use_cpc_uga', False) and getattr(args, 'use_medsa', False):
-            raise ValueError('--use_cpc_uga and --use_medsa are mutually exclusive')
-
-        # ── CPC–UGA (SPIE): tiny policy only — no CoCC modules ────────────
-        if getattr(args, 'use_cpc_uga', False):
-            self.type_policy = PriorityUncertaintyPolicy(
-                state_dim=PriorityUncertaintyPolicy.STATE_DIM,
-            ).to(args.device)
-            self.replay_buffer = ReplayBuffer(
-                capacity=getattr(args, 'dqn_replay_capacity', 10_000)
-            )
-            self.policy_optimizer = torch.optim.AdamW(
-                list(self.type_policy.q_net.parameters()),
-                lr=getattr(args, 'medsa_lr', 1e-4),
-            )
-            self.logger.info('CPC–UGA enabled: clinical priority + mask uncertainty '
-                             '(no CoCC memory / spatial head).')
-
-        elif getattr(args, 'use_medsa', False):
+        if getattr(args, 'use_medsa', False):
             # Edit encoder and memory live in the trainer (share device with SAM)
             self.edit_encoder = EditDeltaEncoder(in_channels=4).to(args.device)
             self.memory       = CorrectionPatternMemory(max_iters=args.iter_nums + 2).to(args.device)
@@ -232,12 +209,6 @@ class Trainer(Trainer_basic):
         return_each_iter=False,
         epoch=0,
     ):
-        if getattr(self.args, 'use_cpc_uga', False):
-            return self._forward_cpc_uga(
-                sam_model, image, label, iter_nums,
-                train=train, return_each_iter=return_each_iter, epoch=epoch,
-            )
-
         use_medsa = getattr(self.args, 'use_medsa', False)
 
         if return_each_iter:
@@ -687,292 +658,6 @@ class Trainer(Trainer_basic):
         return return_loss / max(actual_iters, 1), prev_masks
 
     # ─────────────────────────────────────────────────────────────────────────
-    # CPC–UGA forward (no CoCC: priority ranker + mask uncertainty + tiny DQN)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _forward_cpc_uga(
-        self,
-        sam_model,
-        image,
-        label,
-        iter_nums,
-        train=False,
-        return_each_iter=False,
-        epoch=0,
-    ):
-        if return_each_iter:
-            return_mask_total_iter = torch.zeros(
-                [iter_nums, 1, image.size(2), image.size(3), image.size(4)]
-            )
-
-        image_embedding, feature_list = self.sam.image_encoder(image)
-        self.click_points = []
-        self.click_labels = []
-        return_loss = 0
-        prev_masks = torch.zeros_like(label, dtype=torch.float).to(label.device)
-
-        self._train_loss_components = {
-            'seg': 0., 'boundary': 0., 'dice_reg': 0., 'refine': 0.,
-            'spatial': 0., 'dqn': 0., 'reward': 0.,
-            '_epsilon': 0., '_lam_s': 0., '_lam_rl': 0., '_uncert': 0.,
-            '_act_pt': 0, '_act_bx': 0, '_act_sc': 0, '_act_st': 0,
-            '_episodes': 0,
-        }
-        actual_iters = 0
-
-        lam_rl = _lambda_rl(
-            epoch,
-            start=getattr(self.args, 'cpc_rl_start_epoch', 30),
-            ramp_len=getattr(self.args, 'cpc_rl_ramp_len', 80),
-        ) if train else 0.0
-        epsilon = max(0.05, 0.5 - epoch * 0.003) if train else 0.0
-        if train:
-            self._train_loss_components['_epsilon'] = epsilon
-            self._train_loss_components['_lam_rl'] = lam_rl
-
-        prev_action = ACTION_POINT
-        prev_state_np = None
-        prev_dice = 0.0
-        prev_prio_vol = 0.0
-        prev_bnd = 0.0
-        prev_uncert = 1.0
-        prev_priority_mask = None
-        uncert_sum = 0.0
-
-        for iter_num in range(iter_nums):
-            actual_iters += 1
-            loss = 0
-            prev_masks_sigmoid = torch.sigmoid(prev_masks) if iter_num > 0 else prev_masks
-
-            label_5d = _ensure_5d(label)
-            prev_masks_sigmoid_5d = _ensure_5d(prev_masks_sigmoid)
-            image_5d = _ensure_5d(image)
-
-            pred_bin = (prev_masks_sigmoid_5d > 0.5)
-            true_bin = (label_5d > 0)
-            fn_mask = (true_bin & ~pred_bin).float()
-            fp_mask = (~true_bin & pred_bin).float()
-
-            # ── Clinical priority ranker (clean FN/FP) ────────────────────
-            with torch.no_grad():
-                curr_priority_mask, _, _ = priority_mask_from_errors(
-                    fn_mask[0], fp_mask[0],
-                    prev_masks_sigmoid_5d[0],
-                    image=image_5d[0],
-                    lam_iso=getattr(self.args, 'prio_lam_iso', 1.0),
-                    lam_int=getattr(self.args, 'prio_lam_int', 0.5),
-                    lam_bnd=getattr(self.args, 'prio_lam_bnd', 0.5),
-                )
-            total_vox = float(fn_mask[0].numel())
-            prio_vol = float(curr_priority_mask.sum().item()) / (total_vox + 1e-8)
-            err_union = (fn_mask + fp_mask).clamp(0, 1)
-            # Boundary overlap of error vs prediction surface
-            geo = compute_geometric_descriptors(fn_mask, fp_mask, prev_masks_sigmoid_5d)
-            bnd = float(geo[0, 3].item())
-
-            action = ACTION_POINT
-            if iter_num > 0:
-                curr_dice = self.get_dice_score(prev_masks_sigmoid, label)
-                state = PriorityUncertaintyPolicy.build_state(
-                    dice_current=float(curr_dice),
-                    delta_dice=float(curr_dice) - prev_dice,
-                    iter_progress=iter_num / max(iter_nums, 1),
-                    priority_volume=prio_vol,
-                    uncertainty=prev_uncert,
-                    device=self.args.device,
-                )
-
-                if train and lam_rl > 0:
-                    action = self.type_policy.select_action(
-                        state, epsilon,
-                        priority_volume=prio_vol,
-                        boundary_overlap=bnd,
-                        iter_idx=iter_num,
-                        max_iters=iter_nums,
-                        dice_current=float(curr_dice),
-                        uncertainty=prev_uncert,
-                        uncert_low=getattr(self.args, 'uncert_low', 0.35),
-                        uncert_high=getattr(self.args, 'uncert_high', 0.65),
-                    )
-                    _act_key = {
-                        ACTION_POINT: '_act_pt', ACTION_BOX: '_act_bx',
-                        ACTION_SCRIBBLE: '_act_sc', ACTION_STOP: '_act_st',
-                    }.get(action, '_act_pt')
-                    self._train_loss_components[_act_key] += 1
-
-                    if prev_state_np is not None:
-                        prio_hit = 0.0
-                        if prev_priority_mask is not None:
-                            prio_hit = priority_hit_score(err_union[0], prev_priority_mask)
-                        reward = compute_cpc_reward(
-                            prev_action,
-                            dice_current=float(curr_dice),
-                            dice_prev=prev_dice,
-                            priority_volume=prev_prio_vol,
-                            boundary_overlap=prev_bnd,
-                            priority_hit=prio_hit,
-                            uncertainty=prev_uncert,
-                            beta_priority=getattr(self.args, 'beta_priority', 0.30),
-                            gamma_uncert=getattr(self.args, 'gamma_uncert', 0.20),
-                        )
-                        self._train_loss_components['reward'] += reward
-                        self.replay_buffer.push(
-                            prev_state_np, prev_action, reward,
-                            state.detach().cpu().numpy().squeeze(0), done=False,
-                        )
-
-                    prev_state_np = state.detach().cpu().numpy().squeeze(0)
-                    prev_action = action
-                    prev_dice = float(curr_dice)
-                    prev_prio_vol = prio_vol
-                    prev_bnd = bnd
-                    prev_priority_mask = curr_priority_mask.detach()
-                else:
-                    # Val / pre-RL: greedy gated policy
-                    action = self.type_policy.select_action(
-                        state, 0.0,
-                        priority_volume=prio_vol,
-                        boundary_overlap=bnd,
-                        iter_idx=iter_num,
-                        max_iters=iter_nums,
-                        dice_current=float(curr_dice),
-                        uncertainty=prev_uncert,
-                        uncert_low=getattr(self.args, 'uncert_low', 0.35),
-                        uncert_high=getattr(self.args, 'uncert_high', 0.65),
-                    )
-                    prev_dice = float(curr_dice)
-
-                if action == ACTION_STOP:
-                    actual_iters -= 1
-                    break
-
-            # ── Prompts from priority region (no CoCC) ────────────────────
-            points_input, labels_input, box_input = self.get_points(
-                prev_masks_sigmoid, label,
-                train_mode=train,
-                action=action,
-                priority_mask=curr_priority_mask,
-                image_vol=image_5d,
-            )
-
-            # No medsa_context → spatial next-prompt head is never invoked
-            mask, dice_pred, _spatial_hmap, _iou_tok = self.iteration_forward(
-                sam_model, feature_list, image_embedding, prev_masks,
-                points=[points_input, labels_input], boxes=box_input,
-                medsa_context=None,
-            )
-
-            # ── Mask uncertainty from candidate disagreement ──────────────
-            prev_uncert = mask_uncertainty(mask, dice_pred)
-            uncert_sum += prev_uncert
-
-            B = mask.size(0)
-            if self.args.multiple_outputs:
-                _, max_label_index = torch.max(dice_pred, dim=1)
-                b_idx = torch.arange(B, device=mask.device)
-                mask_best = mask[b_idx, max_label_index].unsqueeze(1)
-            else:
-                mask_best = mask
-
-            if train:
-                iter_components = {'seg': 0., 'boundary': 0., 'dice_reg': 0., 'spatial': 0.}
-                n_cands = 0
-                if self.args.multiple_outputs:
-                    for i in range(mask.size(1)):
-                        l, ld = self.calculate_loss(
-                            mask[:, i, :].unsqueeze(1), prev_masks,
-                            dice_pred[:, i], label, labels_input, iter_num,
-                        )
-                        loss += l
-                        for k in ld:
-                            iter_components[k] = iter_components.get(k, 0.) + ld[k]
-                        n_cands += 1
-                    if n_cands > 0:
-                        for k in iter_components:
-                            iter_components[k] /= n_cands
-                else:
-                    loss, ld = self.calculate_loss(
-                        mask, prev_masks, dice_pred[:, 0], label, labels_input, iter_num,
-                    )
-                    iter_components.update(ld)
-
-                for k in iter_components:
-                    self._train_loss_components[k] = (
-                        self._train_loss_components.get(k, 0.) + iter_components[k]
-                    )
-                if self.args.refine:
-                    if self.args.no_detach:
-                        mask_refine, _ = self.sam.mask_decoder.refine(
-                            image, mask_best, [self.click_points, self.click_labels], mask_best)
-                    else:
-                        mask_refine, _ = self.sam.mask_decoder.refine(
-                            image, mask_best, [self.click_points, self.click_labels],
-                            mask_best.detach())
-                    refine_l = self.loss_segmentation(mask_refine, label)
-                    loss += refine_l
-                    self._train_loss_components['refine'] += refine_l.item()
-                    mask_best = mask_refine
-            else:
-                if self.args.refine:
-                    if self.args.no_detach:
-                        mask_refine, _ = self.sam.mask_decoder.refine(
-                            image, mask_best, [self.click_points, self.click_labels], mask_best)
-                    else:
-                        mask_refine, _ = self.sam.mask_decoder.refine(
-                            image, mask_best, [self.click_points, self.click_labels],
-                            mask_best.detach())
-                    mask_best = mask_refine
-                loss = self.get_dice_score(torch.sigmoid(mask_best), label)
-
-            return_loss += loss
-            prev_masks = mask_best
-            if return_each_iter:
-                return_mask_total_iter[iter_num, :] = mask_best
-
-        # Terminal DQN transition
-        if train and lam_rl > 0 and prev_state_np is not None:
-            final_dice = self.get_dice_score(torch.sigmoid(mask_best), label)
-            reward = compute_cpc_reward(
-                prev_action,
-                dice_current=float(final_dice),
-                dice_prev=prev_dice,
-                priority_volume=prev_prio_vol,
-                boundary_overlap=prev_bnd,
-                priority_hit=0.0,
-                uncertainty=prev_uncert,
-                beta_priority=getattr(self.args, 'beta_priority', 0.30),
-                gamma_uncert=getattr(self.args, 'gamma_uncert', 0.20),
-            )
-            self.replay_buffer.push(
-                prev_state_np, prev_action, reward,
-                np.zeros_like(prev_state_np), done=True,
-            )
-            self._train_loss_components['reward'] += reward
-            self._train_loss_components['_episodes'] += 1
-            self._last_lam_rl = lam_rl
-            self._train_loss_components['dqn'] = 0.0
-
-        if actual_iters > 0:
-            self._train_loss_components['_uncert'] = uncert_sum / actual_iters
-
-        _no_avg = {
-            'dqn', '_epsilon', '_lam_s', '_lam_rl', '_uncert',
-            '_act_pt', '_act_bx', '_act_sc', '_act_st', '_episodes', 'reward',
-        }
-        if train and actual_iters > 0:
-            for k in self._train_loss_components:
-                if k not in _no_avg:
-                    self._train_loss_components[k] /= actual_iters
-        eps_count = self._train_loss_components.get('_episodes', 0)
-        if eps_count > 0:
-            self._train_loss_components['reward'] /= eps_count
-
-        self._clinical_iters_used = actual_iters
-        if return_each_iter:
-            return return_loss / max(actual_iters, 1), return_mask_total_iter
-        return return_loss / max(actual_iters, 1), prev_masks
-
-    # ─────────────────────────────────────────────────────────────────────────
     # iteration_forward (wraps the SAM model forward pass)
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1014,10 +699,7 @@ class Trainer(Trainer_basic):
         image_vol=None,
     ):
         mode = 'train' if train_mode else 'validation'
-        use_priority_prompts = (
-            getattr(self.args, 'use_medsa', False)
-            or getattr(self.args, 'use_cpc_uga', False)
-        )
+        use_priority_prompts = getattr(self.args, 'use_medsa', False)
 
         if action == ACTION_BOX or not use_priority_prompts:
             # Always provide box when action=BOX (or agent disabled → standard path)
@@ -1064,10 +746,7 @@ class Trainer(Trainer_basic):
 
         num_clicks = self.args.num_clicks if mode == 'train' else self.args.num_clicks_validation
         use_prio = (
-            (
-                getattr(self.args, 'use_clinical_priority', False)
-                or getattr(self.args, 'use_cpc_uga', False)
-            )
+            getattr(self.args, 'use_clinical_priority', False)
             and priority_mask is not None
             and priority_mask.sum() > 0
         )

@@ -152,11 +152,6 @@ parser.add_argument('--medsa_lr', type=float, default=1e-4,
                     help='Learning rate for MEDSA policy components '
                          '(edit encoder, memory, spatial head, DQN).')
 
-# ── CPC–UGA (SPIE): Clinical Priority + Uncertainty-Gated Accept ───────────
-# Standalone path — does NOT use CoCC / MedSA (no memory, no next-click head).
-parser.add_argument('--use_cpc_uga', action='store_true',
-                    help='Enable CPC–UGA interactive loop (clinical priority ranker + '
-                         'mask-uncertainty accept/escalate). Mutually exclusive with --use_medsa.')
 parser.add_argument('--use_clinical_priority', action='store_true',
                     help='(Legacy/MedSA hybrid) Rank FN/FP CCs by clinical priority.')
 parser.add_argument('--use_uncertainty_gate', action='store_true',
@@ -177,10 +172,6 @@ parser.add_argument('--gamma_uncert', type=float, default=0.20,
                     help='Reward weight for uncertainty escalate/accept terms.')
 parser.add_argument('--persist_thresh', type=float, default=0.85,
                     help='(Legacy MedSA) Persistence cosine threshold for escalate.')
-parser.add_argument('--cpc_rl_start_epoch', type=int, default=30,
-                    help='Epoch at which CPC–UGA DQN loss begins to ramp.')
-parser.add_argument('--cpc_rl_ramp_len', type=int, default=80,
-                    help='Epochs over which CPC–UGA lambda_rl ramps 0→1.')
 
 # ── Full-FOV / no tight 128³ tumor crop (SPIE clinical figures) ─────────────
 parser.add_argument('--full_volume', action='store_true',
