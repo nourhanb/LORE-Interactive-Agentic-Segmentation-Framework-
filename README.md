@@ -1,8 +1,14 @@
 # LORE — Learning to Reason Over Physician Corrections
 
+**Accepted at MICCAI 2026 Workshop: [CLiMeM](https://climem.github.io/CLiMeM/index.html) — Continual Learning in Medical Multimodal-Vision**
+
 Interactive agentic framework for **3D tumor segmentation**. A policy learns *what* correction to request (click, box, scribble, …) and *when* to stop, conditioned on the current mask, error residuals, and geometric descriptors.
 
 This repository contains the LORE / MedSA agent code (`src-agentic/`) and launch scripts. Datasets and trained weights are not included.
+
+## Abstract
+
+Interactive segmentation models ask a physician to iteratively correct a model’s output until the result is acceptable, yet existing methods treat each correction as an isolated reactive event with no structured reasoning about the interaction itself. In this paper, we propose LORE, an interactive agentic framework built on a frozen 3D SAM backbone that trains an agent to reason over the full history of physician corrections so that it can ask for the right kind of correction at the right time. The agent learns through the Chain of Clinical Corrections (CoCC): it observes the geometry of the current error, accumulates correction patterns across the session to detect recurring structural failures, hypothesizes where the next correction will fall, and verifies its own spatial prediction against the physician’s subsequent action via a novel spatial grounding reward, making the agent rewarded not only for segmentation quality, but for correctly anticipating where the physician will need to act next. Evaluated across six benchmarks spanning CT (colon, pancreas, liver, kidney) and FDG-PET (head-and-neck, lung), LORE consistently achieves strong segmentation quality while substantially reducing physician interaction burden.
 
 ## Repository layout
 
@@ -115,6 +121,7 @@ See `train_code_agentic.sh` / `test_code_agentic.sh` for the full flag sets used
 
 ## Citation
 
-If you use this code, please cite the LORE paper:
+If you use this code, please cite:
 
-> *Learning to Reason Over Physician Corrections: An Interactive Agentic Framework for 3D Tumor Segmentation*
+> *Learning to Reason Over Physician Corrections: An Interactive Agentic Framework for 3D Tumor Segmentation.*  
+> MICCAI 2026 Workshop on Continual Learning in Medical Multimodal-Vision (CLiMeM).
