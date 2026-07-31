@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Data (provide your own under src-agentic/splits/)
+src-agentic/splits/
+
+# Checkpoints / results / logs
+implementation_medsa/
+implementation/
+checkpoint_sam/
+*.pth
+*.pth.tar
+*.out
+*.err
+*.log
+forced_logs/
+viz_prompt/
+viz_*/
+csv_file/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
